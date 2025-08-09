@@ -15,11 +15,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
-// Config
 type Config struct {
 	AllowedRoots []string
 	Username     string
@@ -60,7 +58,6 @@ func loadConfig() Config {
 
 var cfg Config
 
-// Models
 type FileEntry struct {
 	Name    string
 	Path    string
@@ -70,14 +67,6 @@ type FileEntry struct {
 	ModTime time.Time
 }
 
-type DiskUsage struct {
-	Path        string
-	TotalBytes  uint64
-	AvailBytes  uint64
-	UsedBytes   uint64
-	UsedPercent float64
-}
-
 type PageData struct {
 	Title       string
 	CurrentRoot string
@@ -85,7 +74,6 @@ type PageData struct {
 	Breadcrumb  []Crumb
 	Entries     []FileEntry
 	Roots       []string
-	Usages      []DiskUsage
 	Flash       string
 }
 
@@ -94,7 +82,6 @@ type Crumb struct {
 	Link string
 }
 
-// Helpers
 func must[T any](v T, err error) T {
 	if err != nil {
 		log.Fatal(err)
@@ -203,28 +190,6 @@ func urlq(s string) string {
 	return r
 }
 
-func fsUsage(path string) (DiskUsage, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return DiskUsage{}, err
-	}
-	total := uint64(st.Blocks) * uint64(st.Bsize)
-	avail := uint64(st.Bavail) * uint64(st.Bsize)
-	used := total - avail
-	usedPct := 0.0
-	if total > 0 {
-		usedPct = (float64(used) / float64(total)) * 100.0
-	}
-	return DiskUsage{
-		Path:        path,
-		TotalBytes:  total,
-		AvailBytes:  avail,
-		UsedBytes:   used,
-		UsedPercent: usedPct,
-	}, nil
-}
-
-// HTTP
 func withSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -278,12 +243,6 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	usages := make([]DiskUsage, 0, len(cfg.AllowedRoots))
-	for _, rpath := range cfg.AllowedRoots {
-		if u, err := fsUsage(rpath); err == nil {
-			usages = append(usages, u)
-		}
-	}
 	data := PageData{
 		Title:       "Go File Manager",
 		CurrentRoot: root,
@@ -291,7 +250,6 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 		Breadcrumb:  buildBreadcrumb(root, relSafe),
 		Entries:     items,
 		Roots:       cfg.AllowedRoots,
-		Usages:      usages,
 	}
 	render(w, data)
 }
@@ -357,7 +315,7 @@ func handleZip(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(512 << 20); err != nil {
+	if err := r.ParseMultipartForm(512 << 20); err != nil { // 512MB
 		http.Error(w, err.Error(), 400)
 		return
 	}
@@ -458,79 +416,6 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/?root=%s&path=%s", urlq(root), urlq(relSafe)), http.StatusSeeOther)
 }
 
-// Move/Copy helpers
-func copyFile(src, dst string, mode fs.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	if info, err := os.Stat(src); err == nil {
-		_ = os.Chtimes(dst, time.Now(), info.ModTime())
-	}
-	return nil
-}
-
-func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, e error) error {
-		if e != nil {
-			return e
-		}
-		rel, _ := filepath.Rel(src, p)
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		return copyFile(p, target, info.Mode())
-	})
-}
-
-func movePath(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		if err := copyDir(src, dst); err != nil {
-			return err
-		}
-		return os.RemoveAll(src)
-	}
-	if err := copyFile(src, dst, info.Mode()); err != nil {
-		return err
-	}
-	return os.Remove(src)
-}
-
-func copyPath(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return copyDir(src, dst)
-	}
-	return copyFile(src, dst, info.Mode())
-}
-
 func handleRename(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), 400)
@@ -568,80 +453,6 @@ func safeRename(from, to, dir string) error {
 	return os.Rename(from, to)
 }
 
-func handleMove(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	srcRoot := r.Form.Get("src_root")
-	srcRel := r.Form.Get("src_path")
-	name := r.Form.Get("name")
-	dstRoot := r.Form.Get("dst_root")
-	dstRel := r.Form.Get("dst_path")
-	if name == "" {
-		http.Error(w, "name required", 400)
-		return
-	}
-	_, srcAbs, srcRelSafe, err := resolveSafePath(srcRoot, srcRel)
-	if err != nil {
-		http.Error(w, "src: "+err.Error(), 400)
-		return
-	}
-	srcFull := filepath.Join(srcAbs, filepath.Base(name))
-	_, dstAbs, _, err := resolveSafePath(dstRoot, dstRel)
-	if err != nil {
-		http.Error(w, "dst: "+err.Error(), 400)
-		return
-	}
-	if err := os.MkdirAll(dstAbs, 0o755); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	dstFull := filepath.Join(dstAbs, filepath.Base(name))
-	if err := movePath(srcFull, dstFull); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/?root=%s&path=%s", urlq(srcRoot), urlq(srcRelSafe)), http.StatusSeeOther)
-}
-
-func handleCopy(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
-	srcRoot := r.Form.Get("src_root")
-	srcRel := r.Form.Get("src_path")
-	name := r.Form.Get("name")
-	dstRoot := r.Form.Get("dst_root")
-	dstRel := r.Form.Get("dst_path")
-	if name == "" {
-		http.Error(w, "name required", 400)
-		return
-	}
-	_, srcAbs, srcRelSafe, err := resolveSafePath(srcRoot, srcRel)
-	if err != nil {
-		http.Error(w, "src: "+err.Error(), 400)
-		return
-	}
-	srcFull := filepath.Join(srcAbs, filepath.Base(name))
-	_, dstAbs, _, err := resolveSafePath(dstRoot, dstRel)
-	if err != nil {
-		http.Error(w, "dst: "+err.Error(), 400)
-		return
-	}
-	if err := os.MkdirAll(dstAbs, 0o755); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	dstFull := filepath.Join(dstAbs, filepath.Base(name))
-	if err := copyPath(srcFull, dstFull); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/?root=%s&path=%s", urlq(srcRoot), urlq(srcRelSafe)), http.StatusSeeOther)
-}
-
 var pageHTML = `<!doctype html>
 <html lang="pt-br">
 <head>
@@ -660,7 +471,7 @@ var pageHTML = `<!doctype html>
           <label class="text-sm">Disco:</label>
           <select name="root" class="border rounded px-2 py-1">
             {{range .Roots}}
-              <option value="{{.}}">{{.}}</option>
+              <option value="{{.}}" {{if eq . $.CurrentRoot}}selected{{end}}>{{.}}</option>
             {{end}}
           </select>
           <input type="hidden" name="path" value="{{.CurrentPath}}" />
@@ -689,23 +500,6 @@ var pageHTML = `<!doctype html>
         <input class="border rounded px-3 py-2" type="text" name="name" placeholder="Nova pasta" />
         <button class="bg-slate-700 text-white px-4 py-2 rounded">Criar pasta</button>
       </form>
-    </section>
-
-    <section class="mb-4 p-4 bg-white rounded-2xl shadow">
-      <h2 class="font-semibold mb-2">Armazenamento</h2>
-      <div class="space-y-2">
-        {{range .Usages}}
-          <div>
-            <div class="flex justify-between text-sm">
-              <span>{{.Path}}</span>
-              <span>{{printf "%.1f" .UsedPercent}}% usado • {{humanSize (int64 .UsedBytes)}} / {{humanSize (int64 .TotalBytes)}}</span>
-            </div>
-            <div class="w-full h-2 bg-slate-200 rounded">
-              <div class="h-2 rounded" style="width: {{printf "%.0f" .UsedPercent}}%; background:#64748b;"></div>
-            </div>
-          </div>
-        {{end}}
-      </div>
     </section>
 
     <section class="bg-white rounded-2xl shadow">
@@ -750,37 +544,6 @@ var pageHTML = `<!doctype html>
                     <input class="border rounded px-2 py-1 text-sm" type="text" name="new" placeholder="Novo nome" />
                     <button class="px-2 py-1 rounded border">Renomear</button>
                   </form>
-
-                  <!-- Move -->
-                  <form action="/move" method="post" class="flex items-center gap-1">
-                    <input type="hidden" name="src_root" value="{{$.CurrentRoot}}" />
-                    <input type="hidden" name="src_path" value="{{$.CurrentPath}}" />
-                    <input type="hidden" name="name" value="{{.Name}}" />
-                    <label class="text-xs">para:</label>
-                    <select name="dst_root" class="border rounded px-1 py-1 text-sm">
-                      {{range $.Roots}}
-                        <option value="{{.}}">{{.}}</option>
-                      {{end}}
-                    </select>
-                    <input class="border rounded px-2 py-1 text-sm" type="text" name="dst_path" placeholder="." />
-                    <button class="px-2 py-1 rounded border">Mover</button>
-                  </form>
-
-                  <!-- Copy -->
-                  <form action="/copy" method="post" class="flex items-center gap-1">
-                    <input type="hidden" name="src_root" value="{{$.CurrentRoot}}" />
-                    <input type="hidden" name="src_path" value="{{$.CurrentPath}}" />
-                    <input type="hidden" name="name" value="{{.Name}}" />
-                    <label class="text-xs">para:</label>
-                    <select name="dst_root" class="border rounded px-1 py-1 text-sm">
-                      {{range $.Roots}}
-                        <option value="{{.}}">{{.}}</option>
-                      {{end}}
-                    </select>
-                    <input class="border rounded px-2 py-1 text-sm" type="text" name="dst_path" placeholder="." />
-                    <button class="px-2 py-1 rounded border">Copiar</button>
-                  </form>
-
                   <form action="/delete" method="post" onsubmit="return confirm('Excluir {{.Name}}? Esta ação é permanente.');">
                     <input type="hidden" name="root" value="{{$.CurrentRoot}}" />
                     <input type="hidden" name="path" value="{{$.CurrentPath}}" />
@@ -820,8 +583,6 @@ func main() {
 	mux.HandleFunc("/mkdir", basicAuth(handleMkdir))
 	mux.HandleFunc("/delete", basicAuth(handleDelete))
 	mux.HandleFunc("/rename", basicAuth(handleRename))
-	mux.HandleFunc("/move", basicAuth(handleMove))
-	mux.HandleFunc("/copy", basicAuth(handleCopy))
 
 	addr := ":8080"
 	log.Printf("Go File Manager listening on %s (roots: %v)\n", addr, cfg.AllowedRoots)
