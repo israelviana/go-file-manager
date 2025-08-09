@@ -1,28 +1,15 @@
 version: "3.9"
-
 services:
   gofilemgr:
     image: mokusei13/gofilemgr:latest
-    container_name: gofilemgr
     environment:
-      USERNAME_FILE: "/run/secrets/filemgr_username"
-      PASSWORD_FILE: "/run/secrets/filemgr_password"
+      USERNAME: "${FILEMGR_USERNAME}"
+      PASSWORD: "${FILEMGR_PASSWORD}"
       ALLOWED_ROOTS: "${DISK1_PATH},${DISK2_PATH},${DISK3_PATH}"
-    secrets:
-      - filemgr_username
-      - filemgr_password
     volumes:
       - ${DISK1_PATH}:${DISK1_PATH}:rw
       - ${DISK2_PATH}:${DISK2_PATH}:rw
       - ${DISK3_PATH}:${DISK3_PATH}:rw
     ports:
       - "8080:8080"
-    deploy:
-      restart_policy:
-        condition: on-failure
-
-secrets:
-  filemgr_username:
-    external: true
-  filemgr_password:
-    external: true
+    restart: unless-stopped
