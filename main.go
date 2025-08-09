@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -67,13 +68,19 @@ type FileEntry struct {
 	ModTime time.Time
 }
 
+type DiskInfo struct {
+	Path    string
+	Free    string
+	UsedPct string
+}
+
 type PageData struct {
 	Title       string
 	CurrentRoot string
 	CurrentPath string
 	Breadcrumb  []Crumb
 	Entries     []FileEntry
-	Roots       []string
+	Disks       []DiskInfo // Alterado de Roots para Disks com info de uso
 	Flash       string
 }
 
@@ -184,6 +191,16 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
+func getDiskUsage(path string) (total, free uint64, err error) {
+	var stat syscall.Statfs_t
+	if err = syscall.Statfs(path, &stat); err != nil {
+		return 0, 0, err
+	}
+	total = uint64(stat.Blocks) * uint64(stat.Bsize)
+	free = uint64(stat.Bavail) * uint64(stat.Bsize)
+	return total, free, nil
+}
+
 func urlq(s string) string {
 	r := strings.ReplaceAll(s, " ", "%20")
 	r = strings.ReplaceAll(r, "\n", "")
@@ -243,13 +260,36 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Calcular uso de disco para todos os roots
+	var disks []DiskInfo
+	for _, rt := range cfg.AllowedRoots {
+		total, free, err := getDiskUsage(rt)
+		if err != nil {
+			log.Printf("Erro ao obter uso de disco para %s: %v", rt, err)
+			continue
+		}
+		used := total - free
+		var pct string
+		if total > 0 {
+			pct = fmt.Sprintf("%.1f%%", float64(used)/float64(total)*100)
+		} else {
+			pct = "0%"
+		}
+		disks = append(disks, DiskInfo{
+			Path:    rt,
+			Free:    humanSize(int64(free)),
+			UsedPct: pct,
+		})
+	}
+
 	data := PageData{
 		Title:       "Go File Manager",
 		CurrentRoot: root,
 		CurrentPath: relSafe,
 		Breadcrumb:  buildBreadcrumb(root, relSafe),
 		Entries:     items,
-		Roots:       cfg.AllowedRoots,
+		Disks:       disks, // Usado no template
 	}
 	render(w, data)
 }
@@ -453,6 +493,116 @@ func safeRename(from, to, dir string) error {
 	return os.Rename(from, to)
 }
 
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	if err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func copyDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func handleMove(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	sourceRoot := r.Form.Get("root")
+	sourceRel := r.Form.Get("path")
+	targetRoot := r.Form.Get("target_root")
+	targetRel := r.Form.Get("target_path")
+	if targetRel == "" {
+		targetRel = "."
+	}
+	if sourceRoot == targetRoot {
+		http.Error(w, "não pode mover para o mesmo disco (use renomear)", 400)
+		return
+	}
+
+	_, sourceAbs, sourceRelSafe, err := resolveSafePath(sourceRoot, sourceRel)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	_, targetDirAbs, _, err := resolveSafePath(targetRoot, targetRel)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	targetAbs := filepath.Join(targetDirAbs, filepath.Base(sourceAbs))
+
+	// Verificar se alvo existe
+	if _, err := os.Stat(targetAbs); err == nil {
+		http.Error(w, "alvo já existe", 409)
+		return
+	}
+
+	st, err := os.Stat(sourceAbs)
+	if err != nil {
+		http.Error(w, err.Error(), 404)
+		return
+	}
+
+	// Copiar
+	var copyErr error
+	if st.IsDir() {
+		copyErr = copyDir(sourceAbs, targetAbs)
+	} else {
+		copyErr = copyFile(sourceAbs, targetAbs)
+	}
+	if copyErr != nil {
+		http.Error(w, copyErr.Error(), 500)
+		return
+	}
+
+	// Deletar origem
+	if st.IsDir() {
+		os.RemoveAll(sourceAbs)
+	} else {
+		os.Remove(sourceAbs)
+	}
+
+	// Redirecionar para o diretório pai da origem
+	parentRel := filepath.Dir(sourceRelSafe)
+	if parentRel == "." {
+		parentRel = ""
+	}
+	http.Redirect(w, r, fmt.Sprintf("/?root=%s&path=%s", urlq(sourceRoot), urlq(parentRel)), http.StatusSeeOther)
+}
+
 var pageHTML = `<!doctype html>
 <html lang="pt-br">
 <head>
@@ -470,8 +620,8 @@ var pageHTML = `<!doctype html>
         <form method="get" action="/" class="flex items-center gap-2">
           <label class="text-sm">Disco:</label>
           <select name="root" class="border rounded px-2 py-1">
-            {{range .Roots}}
-              <option value="{{.}}" {{if eq . $.CurrentRoot}}selected{{end}}>{{.}}</option>
+            {{range .Disks}}
+              <option value="{{.Path}}" {{if eq .Path $.CurrentRoot}}selected{{end}}>{{.Path}} ({{.Free}} livre, {{.UsedPct}} usado)</option>
             {{end}}
           </select>
           <input type="hidden" name="path" value="{{.CurrentPath}}" />
@@ -528,7 +678,7 @@ var pageHTML = `<!doctype html>
               <td class="py-2 px-4">{{if .IsDir}}—{{else}}{{humanSize .Size}}{{end}}</td>
               <td class="py-2 px-4">{{fmtTime .ModTime}}</td>
               <td class="py-2 px-4">
-                <div class="flex items-center gap-2 justify-end">
+                <div class="flex items-center gap-2 justify-end flex-wrap">
                   {{if not .IsDir}}
                   <a class="px-2 py-1 rounded border" href="/download?root={{$.CurrentRoot}}&path={{.RelPath}}">Baixar</a>
                   {{end}}
@@ -549,6 +699,19 @@ var pageHTML = `<!doctype html>
                     <input type="hidden" name="path" value="{{$.CurrentPath}}" />
                     <input type="hidden" name="name" value="{{.Name}}" />
                     <button class="px-2 py-1 rounded border text-red-700">Excluir</button>
+                  </form>
+                  <form action="/move" method="post" class="flex items-center gap-1">
+                    <input type="hidden" name="root" value="{{$.CurrentRoot}}" />
+                    <input type="hidden" name="path" value="{{.RelPath}}" />
+                    <select name="target_root" class="border rounded px-2 py-1 text-sm">
+                      {{range $d := $.Disks}}
+                        {{if ne $d.Path $.CurrentRoot}}
+                          <option value="{{$d.Path}}">{{$d.Path}}</option>
+                        {{end}}
+                      {{end}}
+                    </select>
+                    <input class="border rounded px-2 py-1 text-sm" type="text" name="target_path" placeholder="Caminho alvo (opcional)" />
+                    <button class="px-2 py-1 rounded border bg-yellow-600 text-white" onclick="return confirm('Mover {{.Name}} para o disco selecionado?');">Mover</button>
                   </form>
                 </div>
               </td>
@@ -583,6 +746,7 @@ func main() {
 	mux.HandleFunc("/mkdir", basicAuth(handleMkdir))
 	mux.HandleFunc("/delete", basicAuth(handleDelete))
 	mux.HandleFunc("/rename", basicAuth(handleRename))
+	mux.HandleFunc("/move", basicAuth(handleMove))
 
 	addr := ":8080"
 	log.Printf("Go File Manager listening on %s (roots: %v)\n", addr, cfg.AllowedRoots)
