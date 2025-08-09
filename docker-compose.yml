@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   gofilemgr:
-    image: israelviana/gofilemgr:latest
+    image: mokusei13/gofilemgr:latest
     container_name: gofilemgr
     environment:
       USERNAME_FILE: "/run/secrets/filemgr_username"
